@@ -224,21 +224,6 @@ class Benchmark:
             rag_config["type"] = "rag"
             self.models[rag_config["model_name"]] = RAGModel(rag_config, model_pool=self.modelpool, accelerator=self.accelerator)
 
-    def _load_watermark_model(self, watermark_configs=None, model_family_name=None, pretrained_model_name=None,
-                              instruct_model_name=None, default_generation_params=None):
-        """
-        Load a watermark model with the specified configuration.
-        """
-        for i, watermark_config in enumerate(watermark_configs):
-            watermark_config["model_family"] = model_family_name
-            watermark_config["pretrained_model"] = pretrained_model_name
-            watermark_config["instruct_model"] = instruct_model_name
-            watermark_config["base_model"] = instruct_model_name
-            watermark_config["model_name"] = instruct_model_name + "_watermark_" + str(i)
-            watermark_config["params"] = default_generation_params
-            watermark_config["type"] = "watermark"
-            self.models[watermark_config["model_name"]] = WatermarkModel(watermark_config, model_pool=self.modelpool, accelerator=self.accelerator)
-
     def _load_cot_model(self, cot_configs=None, model_family_name=None, pretrained_model_name=None,
                         instruct_model_name=None, instruct_model_path=None, default_generation_params=None):
         for i, cot_prompt in enumerate(cot_configs):
