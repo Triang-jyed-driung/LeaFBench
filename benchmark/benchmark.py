@@ -80,6 +80,12 @@ class Benchmark:
                         self._load_rag_model(
                             rag_configs, model_family_name, pretrained_model_name, 
                             instruct_model_name, default_generation_params)
+                    if deploying_techniques.get("watermark", None) is not None:
+                        # If watermarking is specified, create a Watermark model instance
+                        watermark_configs = deploying_techniques["watermark"]
+                        self._load_watermark_model(
+                            watermark_configs, model_family_name, pretrained_model_name, 
+                            instruct_model_name, default_generation_params)
                     if deploying_techniques.get("sampling_settings", None) is not None:
                         # If sampling settings are specified, create models with different sampling configurations
                         sampling_configs = deploying_techniques["sampling_settings"]
@@ -217,6 +223,21 @@ class Benchmark:
             rag_config["params"] = default_generation_params
             rag_config["type"] = "rag"
             self.models[rag_config["model_name"]] = RAGModel(rag_config, model_pool=self.modelpool, accelerator=self.accelerator)
+
+    def _load_watermark_model(self, watermark_configs=None, model_family_name=None, pretrained_model_name=None,
+                              instruct_model_name=None, default_generation_params=None):
+        """
+        Load a watermark model with the specified configuration.
+        """
+        for i, watermark_config in enumerate(watermark_configs):
+            watermark_config["model_family"] = model_family_name
+            watermark_config["pretrained_model"] = pretrained_model_name
+            watermark_config["instruct_model"] = instruct_model_name
+            watermark_config["base_model"] = instruct_model_name
+            watermark_config["model_name"] = instruct_model_name + "_watermark_" + str(i)
+            watermark_config["params"] = default_generation_params
+            watermark_config["type"] = "watermark"
+            self.models[watermark_config["model_name"]] = WatermarkModel(watermark_config, model_pool=self.modelpool, accelerator=self.accelerator)
 
     def _load_cot_model(self, cot_configs=None, model_family_name=None, pretrained_model_name=None,
                         instruct_model_name=None, instruct_model_path=None, default_generation_params=None):
@@ -363,11 +384,15 @@ class Benchmark:
                 # Determine true label (positive if same family, negative otherwise)
                 # For pretrained models: positive if test model's pretrained_model matches base
                 # For instruct models: positive if test model's instruct_model matches base
-                is_positive = False
-                if test_model.pretrained_model == base_model.pretrained_model:
+                # is_positive = False
+                if test_model.pretrained_model == base_model.pretrained_model or test_model.base_model == base_name:
                     is_positive = True
                 else:
                     is_positive = False
+                # if base_model.type == 'pretrained' and test_model.pretrained_model == base_name:
+                #     is_positive = True
+                # elif base_model.type == 'instruct' and test_model.pretrained_model == base_model.pretrained_model:
+                #     is_positive = True
                 
                 labels_matrix[base_name][test_name] = 1 if is_positive else 0
                 
@@ -658,16 +683,18 @@ class Benchmark:
                                {base_model_name: {metric: value}}
         
         Returns:
-            pandas.DataFrame: DataFrame with base models as rows and metrics as columns
+            pandas.DataFrame: DataFrame with metrics as rows and base models as columns
         """
         
         # Convert to DataFrame directly since it's already flat
         df = pd.DataFrame(base_model_metrics).T
         
+        original_model_order = list(base_model_metrics.keys())
+        
         # Reorder columns for better readability
         preferred_order = [
             'Base_Model_Type', 'Model_Family', 'Total_Samples', 'Positive_Samples', 'Negative_Samples',
-            'AUC', 'Accuracy', 'TPR', 'TNR', 'FPR', 'FNR', 
+            'AUC', 'Partial_AUC_0_05', 'Accuracy', 'TPR', 'TNR', 'FPR', 'FNR', 
             'Mean_Diff', 'TPR_at_1_FPR', 'KS_Statistic', 'Mahalanobis_Distance', 'Threshold'
         ]
         
@@ -676,7 +703,14 @@ class Benchmark:
         remaining_columns = [col for col in df.columns if col not in preferred_order]
         final_order = existing_columns + remaining_columns
         
-        return df[final_order]
+        df_reordered = df[final_order]
+        
+        # Transpose the DataFrame so that metrics are rows and base models are columns
+        df_transposed = df_reordered.T
+        
+        df_transposed = df_transposed[original_model_order]
+        
+        return df_transposed
 
     def _calculate_single_metrics(self, similarities, labels, threshold=None):
         """
@@ -695,6 +729,9 @@ class Benchmark:
             # Calculate AUC and ROC curve
             auc = roc_auc_score(labels, similarities)
             fpr_curve, tpr_curve, thresholds_curve = roc_curve(labels, similarities)
+            
+            # Calculate partial AUC for FPR in [0, 0.05]
+            partial_auc = self._calculate_partial_auc(fpr_curve, tpr_curve, max_fpr=0.05)
             
             # Calculate TPR at 1% FPR
             tpr_at_1_fpr = self._calculate_tpr_at_fpr(fpr_curve, tpr_curve, target_fpr=0.01)
@@ -738,6 +775,7 @@ class Benchmark:
         else:
             # If only one class present, set default values
             auc = 0.5
+            partial_auc = 0.0
             tpr_at_1_fpr = 0.0  # Cannot calculate TPR at 1% FPR with only one class
             ks_statistic = 0.0  # Cannot calculate KS statistic with only one class
             mahalanobis_distance = 0.0  # Cannot calculate Mahalanobis distance with only one class
@@ -762,6 +800,7 @@ class Benchmark:
             'FPR': float(fpr_rate),
             'FNR': float(fnr_rate),
             'AUC': float(auc),
+            'Partial_AUC_0_05': float(partial_auc),
             'Accuracy': float(accuracy),
             'Threshold': float(used_threshold),
             'Total_Samples': len(similarities),
@@ -915,6 +954,106 @@ class Benchmark:
         ks_statistic, _ = ks_2samp(positive_similarities, negative_similarities)
         
         return ks_statistic
+
+    def _calculate_partial_auc(self, fpr_curve, tpr_curve, max_fpr=0.05):
+        """
+        Calculates the standardized Partial AUC for FPR values in [0, max_fpr].
+        The result is scaled to the [0.5, 1.0] range.
+        """
+        # Find indices where FPR <= max_fpr
+        valid_indices = np.where(fpr_curve <= max_fpr)[0]
+
+        if len(valid_indices) < 2:
+            # Not enough points for partial AUC calculation
+            return 0.5 # A single point has no area, equivalent to random chance.
+
+        # Get valid FPR and TPR values, ensuring we don't go beyond max_fpr
+        valid_fpr = fpr_curve[valid_indices]
+        valid_tpr = tpr_curve[valid_indices]
+
+        # If max_fpr is not in the curve, interpolate to get the exact endpoint
+        if max_fpr not in valid_fpr:
+            # np.interp is a simpler way to do this
+            tpr_at_max_fpr = np.interp(max_fpr, fpr_curve, tpr_curve)
+            
+            # Add the interpolated point to ensure the area is calculated up to max_fpr
+            valid_fpr = np.append(valid_fpr, max_fpr)
+            valid_tpr = np.append(valid_tpr, tpr_at_max_fpr)
+            
+            # Sort by FPR after appending
+            sort_indices = np.argsort(valid_fpr)
+            valid_fpr = valid_fpr[sort_indices]
+            valid_tpr = valid_tpr[sort_indices]
+            
+        # Calculate the raw partial AUC using the trapezoidal rule
+        raw_partial_auc = np.trapz(valid_tpr, valid_fpr)
+
+        # --- CORRECTED NORMALIZATION LOGIC ---
+        # Define the minimum and maximum possible areas in the [0, max_fpr] range
+        min_area = 0.5 * max_fpr**2
+        max_area = max_fpr
+
+        # Handle the case where the denominator could be zero (if max_fpr is 0)
+        if max_area == min_area:
+            return 0.5
+            
+        # Apply the standard normalization formula
+        standardized_pauc = 0.5 * (1 + (raw_partial_auc - min_area) / (max_area - min_area))
+
+        return standardized_pauc
+        # """
+        # Calculate partial AUC for FPR values in [0, max_fpr].
+        
+        # Args:
+        #     fpr_curve: Array of FPR values from ROC curve
+        #     tpr_curve: Array of TPR values from ROC curve
+        #     max_fpr: Maximum FPR for partial AUC calculation (default: 0.05)
+            
+        # Returns:
+        #     float: Partial AUC value normalized by max_fpr
+        # """
+        
+        # # Find indices where FPR <= max_fpr
+        # valid_indices = np.where(fpr_curve <= max_fpr)[0]
+        
+        # if len(valid_indices) < 2:
+        #     # Not enough points for partial AUC calculation
+        #     return 0.0
+        
+        # # Get valid FPR and TPR values
+        # valid_fpr = fpr_curve[valid_indices]
+        # valid_tpr = tpr_curve[valid_indices]
+        
+        # # If max_fpr is not in the curve, interpolate
+        # if max_fpr not in valid_fpr and max_fpr < fpr_curve.max():
+        #     # Find the insertion point for max_fpr
+        #     insertion_idx = np.searchsorted(fpr_curve, max_fpr)
+        #     if insertion_idx < len(fpr_curve):
+        #         # Linear interpolation
+        #         fpr_before = fpr_curve[insertion_idx - 1]
+        #         fpr_after = fpr_curve[insertion_idx]
+        #         tpr_before = tpr_curve[insertion_idx - 1]
+        #         tpr_after = tpr_curve[insertion_idx]
+                
+        #         # Interpolate TPR at max_fpr
+        #         tpr_at_max_fpr = tpr_before + (tpr_after - tpr_before) * (max_fpr - fpr_before) / (fpr_after - fpr_before)
+                
+        #         # Add the interpolated point
+        #         valid_fpr = np.append(valid_fpr, max_fpr)
+        #         valid_tpr = np.append(valid_tpr, tpr_at_max_fpr)
+                
+        #         # Sort by FPR
+        #         sort_indices = np.argsort(valid_fpr)
+        #         valid_fpr = valid_fpr[sort_indices]
+        #         valid_tpr = valid_tpr[sort_indices]
+        
+        # # Calculate partial AUC using trapezoidal rule
+        # partial_auc = np.trapz(valid_tpr, valid_fpr)
+        
+        # # Normalize by max_fpr to get a value comparable to standard AUC
+        # normalized_partial_auc = partial_auc / max_fpr
+        
+        # return normalized_partial_auc
 
     def _calculate_tpr_at_fpr(self, fpr_curve, tpr_curve, target_fpr=0.01):
         """
